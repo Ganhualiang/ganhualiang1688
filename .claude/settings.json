@@ -18,7 +18,8 @@
       "Bash(.venv/bin/pytest tests/ -q)",
       "Bash(.venv/bin/httpload --url http://localhost:65530/ --requests 50 --concurrency 10 --timeout 500ms)",
       "Bash(.venv/bin/httpload --url not-a-url -n 10)",
-      "Bash(.venv/bin/httpload -u http://localhost/ -n 5 -c 50 -t 0s)"
+      "Bash(.venv/bin/httpload -u http://localhost/ -n 5 -c 50 -t 0s)",
+      "Bash(python3 -c ' *)"
     ]
   }
 }

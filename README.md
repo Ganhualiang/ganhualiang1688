@@ -6,7 +6,7 @@
 
 - 实现语言：Python 3.10+
 - 并发与 HTTP：asyncio + aiohttp
-- 当前验证结果：63 项自动化测试，Windows 11 实测 62 passed / 1 平台跳过（macOS 见「测试策略」说明）
+- 当前验证结果：63 项自动化测试，Windows 11 实测 62 passed / 1 平台跳过，macOS 实测 61 passed / 2 平台跳过
 - 实现目录：[httpload](./httpload)
 - 题目原文：[实习生能力考核题目.md](./实习生能力考核题目.md)
 
@@ -118,15 +118,19 @@ pytest tests/ -v
 最近一次完整验证结果（信号用例按平台跳过，不适用的不算通过）：
 
 ```text
-Windows 11 + Python 3.13:  62 passed, 1 skipped     # 本次实测；跳过 POSIX SIGINT 用例
-macOS:                     55 passed                # 截止前实测（当时共 55 项）
+Windows 11 + Python 3.13:  62 passed, 1 skipped     # 跳过 POSIX SIGINT 用例 1 个
+macOS    + Python 3.12:    61 passed, 2 skipped     # 跳过 Windows 控制台事件用例 2 个
 ```
 
-补齐 Windows 之后我手上没有 macOS 环境，**没有在 macOS 上重跑**。新增的 8 个用例里，
-2 个 Windows 控制台事件用例在 POSIX 上会被 `skipif` 跳过，其余 6 个都是跨平台的（其中
-2 个专门用假事件循环从 Windows 上验证 POSIX 分支的接线与降级路径）；对 macOS 原有行为的
-唯一改动是把信号接线包进 `interrupt_guard`，POSIX 分支仍走 `loop.add_signal_handler`。
-按此推断 macOS 应为 61 passed / 2 skipped，但这是推断，不是实测。
+补齐 Windows 后回到 macOS 重跑，第一次并不是全绿：为缺陷 2 补的反向用例
+（`test_refused_vs_timeout_classification_exclusive`）失败了。它用 50ms 超时断言
+「一定先命中超时、记 4 个 Timeouts」，注释里写着「50ms 一定早于任何平台的连接拒绝上报」
+——这个「任何平台」把 Windows 的连接语义（拒绝约 2s 才上报）当成了普适前提，而 macOS
+回环口毫秒级就回 RST，4 个请求全部被正确记为 Errors。也就是说，它犯的是和缺陷 2 的
+原测试**同一类错误，只是方向相反**。工具的分类逻辑在两个平台上都是对的，改的仍然是
+测试：期望值按平台取（Windows 记 Timeouts / POSIX 记 Errors），互斥与守恒断言两平台
+共用。修正后 macOS 61 passed / 2 skipped，且真实 SIGINT 冒烟（本地 server + Ctrl+C）
+复核通过：退出码 130、`Interrupted: true`、在途请求不计入 Completed。
 
 ## 截止后补充：Windows 支持
 
@@ -198,10 +202,11 @@ aiohttp t=10s : 2.037s -> ClientConnectorError
 
 所以**错的是测试的隐含假设，不是被测代码**。我改了测试而不是实现：把该用例的单请求超时
 按平台取值（Windows 5s / POSIX 0.5s），保留 `errors == 20` 这个强断言；另外补了一个反向
-用例，用 50ms 超时断言「连接拒绝晚于超时时必须记 Timeouts 且 errors == 0」，把两类结果
-互斥、不重复计数这一点在两个平台上都钉住。题目第五节的第三条命令在 Windows 上会显示
-Timeouts，我在 [httpload/README.md](./httpload/README.md) 里专门写了这个差异和复现方法，
-免得看起来像统计错了。
+用例，用 50ms 超时验证「超时先到时必须记 Timeouts」。这个反向用例最初把 Windows 时序写成
+了普适断言，后来在 macOS 重跑时失败——即它自己也犯了和原测试同一类错误，方向相反；最终
+改为期望值按平台取、互斥与守恒断言两平台共用（经过见「测试策略」一节）。题目第五节的
+第三条命令在 Windows 上会显示 Timeouts，我在 [httpload/README.md](./httpload/README.md)
+里专门写了这个差异和复现方法，免得看起来像统计错了。
 
 ### 缺陷 3：英文 Windows 控制台下 `--help` 直接失败
 
@@ -231,7 +236,7 @@ httpload: error: 'charmap' codec can't encode characters in position 234-236
 | `test_install_interrupt_posix_branch_uses_loop_api` | POSIX 分支的接线与撤销逻辑，用假事件循环在任意平台验证（含 Windows） |
 | `test_install_interrupt_degrades_when_platform_lacks_api` | 接线失败只打印 warning 并降级，不让整次压测失败——即缺陷 1 的回归防线 |
 | `test_cli_help_survives_non_utf8_stdout` | 非 UTF-8 stdout 编码下 `--help` 仍以 0 退出 |
-| `test_connection_refused_faster_than_timeout_counts_as_error` | 连接拒绝与超时两类结果互斥、不重复计数 |
+| `test_refused_vs_timeout_classification_exclusive` | 连接拒绝与超时按先到者归类（期望值按平台取），两类结果互斥、不重复计数 |
 
 第二个用例值得单独说一句：Windows 无法向单个子进程投递控制台事件，只能发给整个进程组，
 所以子进程必须用 `CREATE_NEW_PROCESS_GROUP` 独立成组，否则会把 pytest 自己一起中断；而

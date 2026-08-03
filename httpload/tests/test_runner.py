@@ -65,17 +65,24 @@ async def test_connection_errors_no_deadlock(free_port):
     result.check_invariants()
 
 
-async def test_connection_refused_faster_than_timeout_counts_as_error(free_port):
+async def test_refused_vs_timeout_classification_exclusive(free_port):
     """连接失败早于超时上报时必须记 Errors；反之（超时先到）记 Timeouts。
 
-    两类结果互斥，不会重复计数，这一点在两个平台上都成立。
+    哪个先到与平台强相关（见 CONN_REFUSED_TIMEOUT 注释），但两类结果互斥、
+    不重复计数，这一点在两个平台上都成立。
     """
     runner = LoadRunner(
         f"http://127.0.0.1:{free_port}/", requests=4, concurrency=4, timeout=0.05
     )
     result = await asyncio.wait_for(runner.run(), timeout=20)
-    assert result.timeouts == 4  # 50ms 一定早于任何平台的连接拒绝上报
-    assert result.errors == 0
+    if sys.platform == "win32":
+        # Windows 重传 SYN 约 2s 才报拒绝，50ms 超时先命中
+        assert result.timeouts == 4
+        assert result.errors == 0
+    else:
+        # POSIX 回环口毫秒级回 RST，远早于 50ms 超时
+        assert result.errors == 4
+        assert result.timeouts == 0
     result.check_invariants()
 
 

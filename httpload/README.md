@@ -3,6 +3,9 @@
 向指定 URL 发起固定总数的并发 HTTP 请求（默认 GET，支持 POST 等方法与自定义
 Header / Body），输出压测统计结果。基于 **Python 3.10+ / asyncio / aiohttp** 实现。
 
+支持平台：**macOS / Linux / Windows**。优雅中断在 macOS 与 Windows 上已实机验证；
+Linux 与 macOS 共用同一条 POSIX 信号分支，未单独实机运行。
+
 ## 安装
 
 macOS / Linux：
@@ -130,7 +133,10 @@ pytest tests/ -v
 | 平台 | 结果 | 跳过 |
 |---|---|---|
 | Windows 11 / Python 3.13 | 62 passed（实测） | POSIX SIGINT 用例 1 个 |
-| macOS | 补齐 Windows 后未重跑，见根 [README.md](../README.md#测试策略) | Windows 控制台事件用例 2 个 |
+| macOS / Python 3.12 | 61 passed（实测） | Windows 控制台事件用例 2 个 |
+
+macOS 重跑曾暴露一个测试自身的问题（连接拒绝分类的反向用例把 Windows 时序当成了
+普适前提），已修正为按平台取期望值，详见根 [README.md](../README.md#测试策略)。
 
 ## 设计决策
 
@@ -172,7 +178,7 @@ pytest tests/ -v
 | 未监听端口 | ✅ Errors | ✅ Errors（`--timeout 5s`）/ Timeouts（`--timeout 500ms`，见上方说明） |
 | Ctrl+C 优雅中断 | ✅ SIGINT | ✅ CTRL_C_EVENT，0.05s 内退出、退出码 130、输出部分统计 |
 | Ctrl+Break 优雅中断 | 不适用 | ✅ CTRL_BREAK_EVENT（SIGBREAK），同上 |
-| 自动化测试 | ✅ | ✅ 62 passed |
+| 自动化测试 | ✅ 55（原始）/ 61 passed（补齐 Windows 后重跑） | ✅ 62 passed |
 
 ## 已完成 / 未完成
 
