@@ -1,10 +1,16 @@
 """runner 集成测试：总数、并发上限、分类、超时、错误、守恒、内部中止。"""
 
 import asyncio
+import sys
 
 import pytest
 
 from httpload.runner import LoadRunner
+
+# 连接被拒绝需要多久上报，与平台强相关：POSIX 回环口立刻回 RST（毫秒级），
+# Windows 不回 RST 而是重传 SYN，约 2s 后才给出 WSAECONNREFUSED。单请求超时
+# 必须大于这个时间，否则先命中超时、被记成 Timeouts 而不是 Errors。
+CONN_REFUSED_TIMEOUT = 5.0 if sys.platform == "win32" else 0.5
 
 
 async def test_total_requests_correct(server):
@@ -48,11 +54,28 @@ async def test_slow_requests_time_out(server):
 
 async def test_connection_errors_no_deadlock(free_port):
     runner = LoadRunner(
-        f"http://127.0.0.1:{free_port}/", requests=20, concurrency=5, timeout=0.5
+        f"http://127.0.0.1:{free_port}/",
+        requests=20,
+        concurrency=10,
+        timeout=CONN_REFUSED_TIMEOUT,
     )
-    result = await asyncio.wait_for(runner.run(), timeout=10)
+    result = await asyncio.wait_for(runner.run(), timeout=40)
     assert result.errors == 20
     assert result.timeouts == 0
+    result.check_invariants()
+
+
+async def test_connection_refused_faster_than_timeout_counts_as_error(free_port):
+    """连接失败早于超时上报时必须记 Errors；反之（超时先到）记 Timeouts。
+
+    两类结果互斥，不会重复计数，这一点在两个平台上都成立。
+    """
+    runner = LoadRunner(
+        f"http://127.0.0.1:{free_port}/", requests=4, concurrency=4, timeout=0.05
+    )
+    result = await asyncio.wait_for(runner.run(), timeout=20)
+    assert result.timeouts == 4  # 50ms 一定早于任何平台的连接拒绝上报
+    assert result.errors == 0
     result.check_invariants()
 
 

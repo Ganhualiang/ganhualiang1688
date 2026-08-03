@@ -1,16 +1,19 @@
 """命令行入口：参数解析与校验、信号接线、退出码。
 
 退出码约定：0 正常完成、2 参数错误、130 用户中断、1 未预期内部错误。
-优雅中断（SIGINT）保证范围：macOS / Linux。
+优雅中断保证范围：macOS / Linux（SIGINT）、Windows（Ctrl+C / Ctrl+Break）。
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import functools
 import re
 import signal
 import sys
+from collections.abc import Callable
 from urllib.parse import urlparse
 
 from httpload.report import render_json, render_text
@@ -25,6 +28,11 @@ EXIT_OK = 0
 EXIT_INTERNAL = 1
 EXIT_USAGE = 2
 EXIT_INTERRUPTED = 130
+
+IS_WINDOWS = sys.platform == "win32"
+
+# 信号接线可能失败的情形：平台未实现该 API、非主线程调用、信号不可捕获
+_SIGNAL_SETUP_ERRORS = (NotImplementedError, ValueError, RuntimeError, OSError)
 
 
 def parse_duration(s: str) -> float:
@@ -107,6 +115,81 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def interrupt_signals() -> tuple[signal.Signals, ...]:
+    """按“用户中断”处理的信号。Windows 额外含 SIGBREAK（Ctrl+Break）。"""
+    sigs = [signal.SIGINT]
+    sigbreak = getattr(signal, "SIGBREAK", None)  # 仅 Windows 存在
+    if sigbreak is not None:
+        sigs.append(sigbreak)
+    return tuple(sigs)
+
+
+def _install_interrupt(
+    loop: asyncio.AbstractEventLoop, on_interrupt: Callable[[], None]
+) -> Callable[[], None]:
+    """安装中断信号处理器，返回撤销函数。单个信号安装失败只警告并跳过。
+
+    POSIX 用 `loop.add_signal_handler`；Windows 上该 API 未实现（抛
+    NotImplementedError），改用 `signal.signal` 把中断转交给事件循环。
+    """
+    undo: list[Callable[[], None]] = []
+
+    def _win_handler(signum: int, frame: object) -> None:
+        # Windows 的 Python 信号处理器在主线程的字节码边界执行，这里不直接碰
+        # 事件循环状态，只做一次线程安全的转交（同时唤醒循环）。
+        loop.call_soon_threadsafe(on_interrupt)
+
+    for sig in interrupt_signals():
+        try:
+            if IS_WINDOWS:
+                previous = signal.signal(sig, _win_handler)
+                undo.append(functools.partial(signal.signal, sig, previous))
+            else:
+                loop.add_signal_handler(sig, on_interrupt)
+                undo.append(functools.partial(loop.remove_signal_handler, sig))
+        except _SIGNAL_SETUP_ERRORS as e:
+            # 例如非主线程运行，或平台不支持该信号：降级为不可优雅中断，
+            # 但绝不因此让整次压测失败。
+            print(
+                f"httpload: warning: cannot handle {sig.name} gracefully: {e!r}",
+                file=sys.stderr,
+            )
+
+    def _undo() -> None:
+        for fn in undo:
+            with contextlib.suppress(*_SIGNAL_SETUP_ERRORS):
+                fn()
+
+    return _undo
+
+
+@contextlib.asynccontextmanager
+async def interrupt_guard(on_interrupt: Callable[[], None]):
+    """在上下文内把用户中断信号接到 on_interrupt，退出时恢复原处理器。
+
+    Windows 上不需要额外的定时唤醒任务：ProactorEventLoop 构造时已经调用
+    `signal.set_wakeup_fd(self._csock.fileno())`（见 asyncio/proactor_events.py），
+    信号会写自管道并立即打断 IOCP 等待，处理器随下一次循环迭代执行。
+    """
+    loop = asyncio.get_running_loop()
+    undo = _install_interrupt(loop, on_interrupt)
+    try:
+        yield
+    finally:
+        undo()
+
+
+def harden_stdio() -> None:
+    """让无法编码的字符降级为替代字符，而不是抛 UnicodeEncodeError。
+
+    Windows 控制台默认代码页（如英文环境 cp1252）编不出帮助文本里的中文，
+    原本会导致 `--help` 直接失败。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(AttributeError, ValueError, OSError):
+            stream.reconfigure(errors="replace")
+
+
 async def _run(args: argparse.Namespace) -> int:
     runner = LoadRunner(
         url=args.url,
@@ -118,12 +201,8 @@ async def _run(args: argparse.Namespace) -> int:
         body=args.body,
         show_progress=args.progress,
     )
-    loop = asyncio.get_running_loop()
-    loop.add_signal_handler(signal.SIGINT, runner.request_stop)
-    try:
+    async with interrupt_guard(runner.request_stop):
         result = await runner.run()
-    finally:
-        loop.remove_signal_handler(signal.SIGINT)
 
     if args.json:
         print(render_json(result, args.url, method=args.method))
@@ -136,6 +215,7 @@ async def _run(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    harden_stdio()
     try:
         args = parse_args(argv)
     except ValueError as e:
@@ -143,8 +223,13 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_USAGE
     try:
         return asyncio.run(_run(args))
+    except KeyboardInterrupt:
+        # 信号处理器未接上时（见 _install_interrupt 的降级分支）的兜底路径
+        print("httpload: interrupted before results were collected.", file=sys.stderr)
+        return EXIT_INTERRUPTED
     except Exception as e:  # noqa: BLE001 — 顶层兜底
-        print(f"httpload: unexpected error: {e}", file=sys.stderr)
+        # 带上异常类型：NotImplementedError 这类空消息异常否则无从定位
+        print(f"httpload: unexpected error: {type(e).__name__}: {e}", file=sys.stderr)
         return EXIT_INTERNAL
 
 

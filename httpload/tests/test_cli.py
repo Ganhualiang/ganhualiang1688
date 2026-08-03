@@ -1,4 +1,4 @@
-"""cli 测试：duration/URL 校验单元测试 + 子进程端到端 + POSIX SIGINT。
+"""cli 测试：duration/URL 校验单元测试 + 子进程端到端 + 信号中断（POSIX / Windows）。
 
 注意：fixture server 跑在 pytest 进程的事件循环上，子进程调用必须放到
 线程（asyncio.to_thread）里执行，否则会阻塞事件循环导致 server 无法响应。
@@ -6,15 +6,25 @@
 
 import asyncio
 import json
+import os
 import signal
 import subprocess
 import sys
 
 import pytest
 
-from httpload.cli import parse_args, parse_duration, parse_header, validate_url
+from httpload import cli
+from httpload.cli import (
+    interrupt_guard,
+    interrupt_signals,
+    parse_args,
+    parse_duration,
+    parse_header,
+    validate_url,
+)
 
 PYTHON = sys.executable
+IS_WINDOWS = sys.platform == "win32"
 
 
 # ---------- parse_duration ----------
@@ -186,21 +196,143 @@ async def test_cli_progress_written_to_stderr(server):
     assert "Completed:      10" in proc.stdout
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal test")
-async def test_cli_sigint_graceful_exit(server):
+async def test_cli_help_survives_non_utf8_stdout():
+    """帮助文本含中文，stdout 编码编不出时也不能失败（英文 Windows 控制台）。"""
+    env = {**os.environ, "PYTHONIOENCODING": "ascii"}
+    proc = await asyncio.to_thread(
+        subprocess.run,
+        [PYTHON, "-m", "httpload", "--help"],
+        capture_output=True, text=True, timeout=30, env=env,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "--concurrency" in proc.stdout
+
+
+# ---------- 信号中断：进程内接线 ----------
+
+def test_interrupt_signals_covers_platform():
+    sigs = interrupt_signals()
+    assert signal.SIGINT in sigs
+    # Windows 上 Ctrl+Break（以及发给新进程组的 CTRL_BREAK_EVENT）走 SIGBREAK；
+    # SIGBREAK 在 POSIX 上不存在，所以用 getattr 取。
+    sigbreak = getattr(signal, "SIGBREAK", None)
+    assert (sigbreak is not None and sigbreak in sigs) is IS_WINDOWS
+
+
+async def test_interrupt_guard_routes_sigint_to_callback():
+    """在真实事件循环上验证：SIGINT 触发回调，且退出后不残留自己的处理器。
+
+    覆盖两条平台分支——POSIX 的 loop.add_signal_handler 与 Windows 的
+    signal.signal + call_soon_threadsafe。
+    """
+    original = signal.getsignal(signal.SIGINT)
+    fired = asyncio.Event()
+    async with interrupt_guard(fired.set):
+        signal.raise_signal(signal.SIGINT)
+        await asyncio.wait_for(fired.wait(), timeout=5)
+    # Windows 分支恢复成进入前的处理器；POSIX 的 remove_signal_handler 固定恢复成
+    # default_int_handler。两者都不应留下 httpload 自己的处理器。
+    assert signal.getsignal(signal.SIGINT) in (original, signal.default_int_handler)
+
+
+class _FakeLoop:
+    """只记录调用的假事件循环；raises 非空时模拟平台不支持该 API。"""
+
+    def __init__(self, raises: Exception | None = None):
+        self.raises = raises
+        self.added: list[tuple[int, object]] = []
+        self.removed: list[int] = []
+
+    def add_signal_handler(self, sig, cb):
+        if self.raises is not None:
+            raise self.raises
+        self.added.append((sig, cb))
+
+    def remove_signal_handler(self, sig):
+        self.removed.append(sig)
+
+
+def test_install_interrupt_posix_branch_uses_loop_api(monkeypatch):
+    """POSIX 分支的接线与撤销逻辑，用假循环在任意平台上验证。"""
+    monkeypatch.setattr(cli, "IS_WINDOWS", False)
+    loop, cb = _FakeLoop(), lambda: None
+    undo = cli._install_interrupt(loop, cb)
+    assert loop.added == [(sig, cb) for sig in interrupt_signals()]
+    undo()
+    assert loop.removed == list(interrupt_signals())
+
+
+def test_install_interrupt_degrades_when_platform_lacks_api(monkeypatch, capsys):
+    """接线失败只警告并降级，不能让整次压测失败——这正是原先 Windows 上的缺陷。
+
+    `add_signal_handler` 在 Windows 抛出的 NotImplementedError 消息为空字符串，
+    所以这里用 repr 输出，避免又变成一句没有信息量的报错。
+    """
+    monkeypatch.setattr(cli, "IS_WINDOWS", False)
+    undo = cli._install_interrupt(_FakeLoop(raises=NotImplementedError()), lambda: None)
+    undo()  # 撤销空接线也必须安全
+    err = capsys.readouterr().err
+    assert "warning" in err
+    assert "SIGINT" in err
+    assert "NotImplementedError()" in err
+
+
+# ---------- 信号中断：子进程端到端 ----------
+
+async def _interrupt_cli_and_assert(popen_kwargs: dict, send: "signal.Signals", server):
+    """启动长压测子进程 → 发送中断信号 → 断言 130 与部分统计。"""
     proc = subprocess.Popen(
-        [PYTHON, "-m", "httpload",
+        [*popen_kwargs.pop("argv"),
          "--url", server.url("/slow?delay=0.1"),
          "--requests", "100000", "--concurrency", "5", "--timeout", "5s"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, **popen_kwargs,
     )
     await asyncio.sleep(1.0)  # 等压测真正开始
-    proc.send_signal(signal.SIGINT)
+    proc.send_signal(send)
     try:
         stdout, stderr = await asyncio.to_thread(proc.communicate, timeout=10)
     except subprocess.TimeoutExpired:
         proc.kill()
-        pytest.fail("process did not exit within 10s after SIGINT")
+        pytest.fail(f"process did not exit within 10s after {send!r}")
     assert proc.returncode == 130, stderr
     assert "Interrupted:    true" in stdout
     assert "Scheduled:" in stdout
+    return stdout
+
+
+@pytest.mark.skipif(IS_WINDOWS, reason="POSIX signal test")
+async def test_cli_sigint_graceful_exit(server):
+    await _interrupt_cli_and_assert(
+        {"argv": [PYTHON, "-m", "httpload"]}, signal.SIGINT, server
+    )
+
+
+# Windows 无法向单个子进程投递控制台事件，只能发给整个进程组，因此子进程必须
+# 用 CREATE_NEW_PROCESS_GROUP 独立成组，否则会把 pytest 自己一起中断。
+@pytest.mark.skipif(not IS_WINDOWS, reason="Windows console control event test")
+async def test_cli_ctrl_break_graceful_exit(server):
+    await _interrupt_cli_and_assert(
+        {"argv": [PYTHON, "-m", "httpload"],
+         "creationflags": subprocess.CREATE_NEW_PROCESS_GROUP},
+        signal.CTRL_BREAK_EVENT,
+        server,
+    )
+
+
+# CREATE_NEW_PROCESS_GROUP 会顺带屏蔽新组的 Ctrl+C，所以子进程先用
+# SetConsoleCtrlHandler(None, False) 把它恢复，才能测到真实的 Ctrl+C 路径。
+_REENABLE_CTRL_C_AND_RUN = (
+    "import ctypes, runpy; "
+    "ctypes.windll.kernel32.SetConsoleCtrlHandler(None, False); "
+    "runpy.run_module('httpload', run_name='__main__')"
+)
+
+
+@pytest.mark.skipif(not IS_WINDOWS, reason="Windows console control event test")
+async def test_cli_ctrl_c_graceful_exit(server):
+    await _interrupt_cli_and_assert(
+        {"argv": [PYTHON, "-c", _REENABLE_CTRL_C_AND_RUN],
+         "creationflags": subprocess.CREATE_NEW_PROCESS_GROUP},
+        signal.CTRL_C_EVENT,
+        server,
+    )

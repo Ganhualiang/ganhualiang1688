@@ -1,0 +1,12 @@
+# Python 缓存与构建产物
+__pycache__/
+*.py[cod]
+build/
+dist/
+
+# 虚拟环境与测试缓存（venv / pytest 会自建自己的 .gitignore，这里再兜一层）
+.venv/
+.pytest_cache/
+
+# 系统产物
+.DS_Store
