@@ -1,0 +1,2 @@
+[console_scripts]
+httpload = httpload.cli:main

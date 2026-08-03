@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -la /Users/ro23nl)",
+      "Read(//Users/**)",
+      "Read(//opt/homebrew/bin/**)",
+      "Bash(command -v uv)",
+      "Bash(uv venv *)",
+      "Bash(uv pip *)",
+      "Bash(.venv/bin/python -m pytest tests/ -v)",
+      "Read(//private/tmp/**)",
+      "Bash(/opt/homebrew/bin/python3.12 -m http.server 8123)",
+      "Bash(echo \"server pid: $!\")",
+      "Bash(.venv/bin/httpload --url http://localhost:8123/ --requests 10000 --concurrency 50 --timeout 2s)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(git -C .. log --oneline)",
+      "Bash(.venv/bin/python -m pytest tests/ -q)",
+      "Bash(.venv/bin/pytest tests/ -q)",
+      "Bash(.venv/bin/httpload --url http://localhost:65530/ --requests 50 --concurrency 10 --timeout 500ms)",
+      "Bash(.venv/bin/httpload --url not-a-url -n 10)",
+      "Bash(.venv/bin/httpload -u http://localhost/ -n 5 -c 50 -t 0s)"
+    ]
+  }
+}
